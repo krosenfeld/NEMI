@@ -68,3 +68,22 @@ For **why** this workflow is designed this way, read [About NEMI](about.md). For
 
 - Try your own `X` with the same three steps (`NEMI()`, `run`, `plot`).
 - To run multiple stochastic runs and combine them, see `NEMI.run(X, n=...)` in the [API reference](reference.md).
+
+If you want the ensemble to choose the base member with the **lowest average relabelled entropy**, pass an `ensemble_dict` when you create the workflow:
+
+```python
+from nemi import NEMI
+
+params = {
+    "ensemble_dict": {
+        "base_selection": "min_entropy",
+        "base_id": 0,
+        "max_clusters": None,
+    }
+}
+
+nemi = NEMI(params=params)
+nemi.run(X, n=5)
+```
+
+With `base_selection="fixed"` (the default), NEMI keeps the selected `base_id` and still computes a majority-vote consensus.

@@ -15,16 +15,33 @@ __all__ = ['NEMI', 'SingleNemi']
 
 default_params = dict(
     embedding_dict = dict(min_dist=0.0, n_components=3, n_neighbors=20),
-    clustering_dict = dict(linkage='ward',  n_clusters=30, n_neighbors=40)
+    clustering_dict = dict(linkage='ward',  n_clusters=30, n_neighbors=40),
+    ensemble_dict = dict(base_selection='fixed', base_id=0, max_clusters=None)
 )
+
+
+def _merge_params(params=None):
+    """Merge user parameters into the nested default parameter dictionary."""
+
+    merged = copy.deepcopy(default_params)
+    for key, value in (params or {}).items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key].update(value)
+        else:
+            merged[key] = value
+
+    return merged
 
 
 class SingleNemi():
     """
-    A single instance of the NEMI pipeline
+    A single instance of the NEMI pipeline.
 
     Args:
-        params (dict, optional): A dictionary of the embedding and clustering options. Defaults to ``nemi.workflow.default_params``.
+        params (dict, optional): Nested parameter dictionary for the workflow.
+            Supported keys are ``embedding_dict``, ``clustering_dict``, and
+            ``ensemble_dict``. Missing values fall back to
+            ``nemi.workflow.default_params``.
     """
 
     def __init__(self, params=None):
@@ -32,8 +49,7 @@ class SingleNemi():
         # pipeline parameters
         # self.params = sc.mergedicts(default_params, params)
         # pipeline parameters
-        self.params = copy.deepcopy(default_params)
-        self.params.update(params if params is not None else {})
+        self.params = _merge_params(params)
 
         # set during the run
         self.embedding = None
@@ -203,31 +219,49 @@ class SingleNemi():
 
 
 class NEMI(SingleNemi):
-    """ Main NEMI workflow
+    """ Main NEMI workflow.
 
     Args:
-        params (dict, optional): clustering and enbedding algorithm parameters.
+        params (dict, optional): Nested parameter dictionary for the workflow.
+            Use ``embedding_dict`` and ``clustering_dict`` to configure a single
+            run, and ``ensemble_dict`` to control how ensemble members are
+            compared when ``n > 1``.
     """
 
     def __init__(self, params=None):
         # pipeline parameters
-        self.params = copy.deepcopy(default_params)
-        self.params.update(params if params is not None else {})
+        self.params = _merge_params(params)
+        self.embedding = None
+        self.clusters = None
+        self.X = None
+        self.nemi_pack = []
         self.base_id = None
+        self.base_selection = None
+        self.base_scores = None
+        self.sorted_overlap = None
+        self.agg_overlaps = None
+        self.entropy = None
+        self.entropy_by_base = None
 
     def run(self, X, n=1):
-        """ Run the NEMI pipeline
+        """ Run the NEMI pipeline.
 
-        The pipeline consists of steps: 
-        
-        - fitting the embedding
-        - predicting the clusters, 
-        - sorting the clusters by descending size
+        A single run fits the embedding, predicts clusters, and sorts cluster
+        labels by descending size. When ``n > 1``, NEMI runs an ensemble of
+        stochastic realisations and combines them using the strategy from
+        ``params['ensemble_dict']``.
 
         Args:
-            X (:py:class:`~numpy.ndarray`): The data contained in a sparse matrix of shape (``n_samples``, ``n_features``)
+            X (:py:class:`~numpy.ndarray`): The data contained in a sparse matrix of shape (``n_samples``, ``n_features``).
             n (int, optional): Number of iterations to run. Defaults to 1.
+
+        Notes:
+            Ensemble runs populate ``base_id``, ``base_selection``,
+            ``sorted_overlap``, ``agg_overlaps``, ``entropy``,
+            ``entropy_by_base``, and ``base_scores`` on the workflow instance.
         """
+        self.X = X
+
         if n == 1:
             super().run(X)
             return
@@ -245,7 +279,7 @@ class NEMI(SingleNemi):
 
             self.nemi_pack = nemi_pack
 
-        self.assess_overlap()
+        self.assess_overlap(**self.params['ensemble_dict'])
 
     def plot(self, to_plot=None, plot_ensemble=False, **kwargs):
 
@@ -256,107 +290,162 @@ class NEMI(SingleNemi):
         if to_plot == 'clusters':
             super().plot('clusters')
 
-    def assess_overlap(self, base_id:int =0, max_clusters=None, **kwargs):
-        """ Assess the overlap between the clusters.
+    def _relabel_overlaps(self, base_id:int =0, max_clusters=None):
+        """Relabel all ensemble members against a selected base member."""
 
-        Args:
-            base_id (int, optional): index (starting at 0) of ensemble member to use as the base comparison
-        """
+        self._validate_base_id(base_id)
 
-        self.base_id = base_id
-        self.embedding = self.nemi_pack[base_id].embedding
-
-        # list of ensemble members we are comparing to the base
         compare_ids = [i for i in range(len(self.nemi_pack))]
         compare_ids.pop(base_id)
 
-        # identify clusters from the base ensemble member
         base_labels = self.nemi_pack[base_id].clusters
-
-        # number of clusters
         num_clusters = int(np.max(base_labels) + 1)
 
-        # if not pre-set, set max number of clusters to total number of clusters in the base
         if max_clusters is None:
             max_clusters = num_clusters
 
-        sortedOverlap=np.zeros((len(compare_ids)+1, max_clusters, base_labels.shape[0]))*np.nan
+        if max_clusters < 1 or max_clusters > num_clusters:
+            raise ValueError(f'max_clusters must be between 1 and {num_clusters}')
 
-        print(num_clusters, max_clusters)
-        summaryStats=np.zeros((num_clusters, max_clusters))
+        sorted_overlap = np.zeros((len(compare_ids)+1, max_clusters, base_labels.shape[0])) * np.nan
 
-        # compile sorted cluster data
-        # TODO: add assert statement to make sure that the clusters have been sorted?
-        dataVector=[nemi.clusters for id, nemi in enumerate(self.nemi_pack) if id != base_id]
+        data_vector = [nemi.clusters for id, nemi in enumerate(self.nemi_pack) if id != base_id]
 
-        # loop over ensemble members, not including the base member
         for compare_cnt, compare_id in enumerate(compare_ids):
-            # grab clusters of ensemble member
-            compare_labels= dataVector[compare_cnt]
+            compare_labels = data_vector[compare_cnt]
+            summary_stats = np.zeros((num_clusters, max_clusters))
 
-            # go through each cluster in the base and assess the percentage overlap
-            # for every cluster in the ensemble member (overlap / total coverage area) 
-            for c1 in range(max_clusters): 
-                # Initialize dummy array to mark location of the cluster for the base member
+            for c1 in range(max_clusters):
                 data1_M = np.zeros(base_labels.shape, dtype=int)
-                # mark where the considered cluster is in the member that is being used as the baseline
-                data1_M[np.where(c1==base_labels)] = 1 
-                # # Count numer of entries [Why?] 
-                summaryStats[0, c1]=np.sum(data1_M) 
+                data1_M[np.where(c1 == base_labels)] = 1
 
-                # go through each cluster
-                # k = 0
                 for c2 in range(num_clusters):
-                    # Initialize dummy array to mark where the cluster is in the comparison member
-                    data2_M = np.zeros(base_labels.shape, dtype=int) 
+                    data2_M = np.zeros(base_labels.shape, dtype=int)
+                    data2_M[np.where(c2 == compare_labels)] = 1
 
-                    # mark where the considered cluster is in the member that is being used as the comparison
-                    data2_M[np.where(c2==compare_labels)] = 1    
+                    num_overlap = np.sum(data1_M * data2_M)
+                    num_total = np.sum(data1_M | data2_M)
+                    summary_stats[c2, c1] = (num_overlap / num_total) * 100
 
-                    # Sum of flags where the two datasets of that cluster are both present
-                    num_overlap=np.sum(data1_M*data2_M)       
+            used_clusters = set()
+            for c1 in range(max_clusters):
+                sorted_overlap_for_one_cluster = np.zeros(base_labels.shape, dtype=int) * np.nan
+                sorted_clusters = np.argsort(summary_stats[:, c1])[::-1]
+                biggest_cluster = [ele for ele in sorted_clusters if ele not in used_clusters][0]
+                used_clusters.add(biggest_cluster)
 
-                    #Sum of where they overlap
-                    num_total=np.sum(data1_M | data2_M)       
-
-                    #Collect the number that is largest of k and the num_overlap/num_total
-                    # k = max(k, num_overlap / num_total)       
-                    summaryStats[c2, c1]=(num_overlap / num_total)*100 # Add percentage of coverage
-
-                #Filled in 'summaryStatistics' matrix results of percentage overlaps
-
-            usedClusters = set() # Used to mak sure clusters don't get selected twice
-            #Clusters are already sorted by size
-            
-            sortedOverlapForOneCluster=np.zeros(base_labels.shape, dtype=int)*np.nan
-            # go through clusters from (biggest to smallest since they are sorted)
-            for c1 in range(max_clusters):  
-                sortedOverlapForOneCluster=np.zeros(base_labels.shape, dtype=int)*np.nan
-                #print('cluster number ', c1, summaryStats.shape, summaryStats[1:,c1-1].shape)
-
-                # find biggest cluster in first column, making sure it has not been used
-                sortedClusters = np.argsort(summaryStats[:, c1])[::-1]
-                biggestCluster = [ele for ele in sortedClusters if ele not in usedClusters][0]
-
-                # record it for later
-                usedClusters.add(biggestCluster)
-
-                # Initialize dummy array
                 data2_M = np.zeros(base_labels.shape, dtype=int)
+                data2_M[np.where(biggest_cluster == compare_labels)] = 1
 
-                # Select which country is being assessed
-                data2_M[np.where(biggestCluster == compare_labels)]=1 # Select cluster being assessed
+                sorted_overlap_for_one_cluster[np.where(data2_M == 1)] = 1
+                sorted_overlap[compare_id, c1, :] = sorted_overlap_for_one_cluster
 
-                sortedOverlapForOneCluster[np.where(data2_M==1)]=1
-                sortedOverlap[compare_id, c1, :] = sortedOverlapForOneCluster
+        for c1 in range(max_clusters):
+            sorted_overlap[base_id, c1, :] = 1 * (base_labels == c1)
 
-        # fill in the base entry in the sorted overlap
-        for c1 in range(max_clusters):  
-            sortedOverlap[base_id, c1, :] = 1 * (base_labels == c1)
+        return sorted_overlap
 
-        # majority vote
-        aggOverlaps = np.nansum(sortedOverlap,axis=0)
-        voteOverlaps = np.argmax(aggOverlaps,axis=0)
+    def _entropy_from_sorted_overlap(self, sorted_overlap):
+        """Return normalized per-sample Shannon entropy from relabelled overlaps."""
 
-        # save clusters estimated from the ensemble
-        self.clusters = voteOverlaps
+        relabelled_clusters = np.argmax(np.nan_to_num(sorted_overlap), axis=1).astype(int)
+        max_clusters = sorted_overlap.shape[1]
+        counts = np.zeros((relabelled_clusters.shape[1], max_clusters), dtype=float)
+
+        for cluster_id in range(max_clusters):
+            counts[:, cluster_id] = np.sum(relabelled_clusters == cluster_id, axis=0)
+
+        totals = counts.sum(axis=1, keepdims=True)
+        probabilities = np.divide(counts, totals, out=np.zeros_like(counts), where=totals > 0)
+        log_probabilities = np.zeros_like(probabilities)
+        positive_probabilities = probabilities > 0
+        log_probabilities[positive_probabilities] = np.log2(probabilities[positive_probabilities])
+        entropy = -(probabilities * log_probabilities).sum(axis=1)
+
+        entropy_max = np.log2(max_clusters)
+        if entropy_max == 0:
+            return np.zeros(entropy.shape[0])
+
+        return (entropy * 100) / entropy_max
+
+    def _entropy_for_base(self, base_id:int =0, max_clusters=None):
+        """Calculate relabelled overlaps and entropy for one base member."""
+
+        sorted_overlap = self._relabel_overlaps(base_id=base_id, max_clusters=max_clusters)
+        entropy = self._entropy_from_sorted_overlap(sorted_overlap)
+        return entropy, sorted_overlap
+
+    def _majority_vote(self, sorted_overlap):
+        """Aggregate relabelled overlaps with a majority vote."""
+
+        agg_overlaps = np.nansum(sorted_overlap, axis=0)
+        vote_overlaps = np.argmax(agg_overlaps, axis=0)
+        return agg_overlaps, vote_overlaps
+
+    def _validate_base_id(self, base_id):
+        if base_id < 0 or base_id >= len(self.nemi_pack):
+            raise ValueError(f'base_id must be between 0 and {len(self.nemi_pack) - 1}')
+
+    def assess_overlap(self, base_id:int =0, max_clusters=None, base_selection='fixed', **kwargs):
+        """Assess agreement across an ensemble and export consensus cluster labels.
+
+        Args:
+            base_id (int, optional): Index of ensemble member to use as the base comparison.
+            max_clusters (int, optional): Number of sorted clusters to compare. When
+                ``None``, use all sorted clusters from the selected base member.
+            base_selection (str, optional): Strategy used to choose the base member.
+                Use ``'fixed'`` to keep ``base_id`` or ``'min_entropy'`` to choose
+                the member with the lowest mean relabelled entropy.
+
+        Returns:
+            None. Consensus labels are written to ``self.clusters``.
+
+        Notes:
+            This method also stores ensemble diagnostics on the instance,
+            including ``base_id``, ``base_selection``, ``sorted_overlap``,
+            ``agg_overlaps``, ``entropy``, ``entropy_by_base``, and
+            ``base_scores``.
+        """
+
+        if not self.nemi_pack:
+            raise RuntimeError('Cannot assess overlap before running an ensemble (n > 1)')
+
+        if base_selection == 'fixed':
+            self._validate_base_id(base_id)
+            sorted_overlap = self._relabel_overlaps(base_id=base_id, max_clusters=max_clusters)
+            entropy = self._entropy_from_sorted_overlap(sorted_overlap)
+            entropy_by_base = None
+            base_scores = None
+        elif base_selection == 'min_entropy':
+            entropy_by_base = []
+            base_scores = []
+            sorted_overlaps = []
+
+            for candidate_base_id in range(len(self.nemi_pack)):
+                candidate_entropy, candidate_overlap = self._entropy_for_base(
+                    base_id=candidate_base_id,
+                    max_clusters=max_clusters,
+                )
+                entropy_by_base.append(candidate_entropy)
+                base_scores.append(candidate_entropy.mean())
+                sorted_overlaps.append(candidate_overlap)
+
+            entropy_by_base = np.vstack(entropy_by_base)
+            base_scores = np.asarray(base_scores)
+            base_id = int(np.argmin(base_scores))
+            entropy = entropy_by_base[base_id]
+            sorted_overlap = sorted_overlaps[base_id]
+        else:
+            raise ValueError("base_selection must be 'fixed' or 'min_entropy'")
+
+        agg_overlaps, vote_overlaps = self._majority_vote(sorted_overlap)
+
+        self.base_id = base_id
+        self.base_selection = base_selection
+        self.embedding = self.nemi_pack[base_id].embedding
+        self.sorted_overlap = sorted_overlap
+        self.agg_overlaps = agg_overlaps
+        self.entropy = entropy
+        self.entropy_by_base = entropy_by_base
+        self.base_scores = base_scores
+        self.clusters = vote_overlaps
